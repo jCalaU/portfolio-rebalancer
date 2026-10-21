@@ -7,15 +7,45 @@ from types import MappingProxyType
 from typing import Literal
 
 
+# Use extra digits to reduce rounding errors.
 CALCULATION_PRECISION = 50
+ALLOCATION_TOLERANCE = Decimal("0.000001")
 ZERO = Decimal("0")
 ONE = Decimal("1")
 
 
 def _money_context() -> Context:
+    # Use a local context so caller settings do not change results.
     context = Context(prec=CALCULATION_PRECISION, rounding=ROUND_HALF_EVEN)
-    context.traps[Inexact] = True
+    context.traps[Inexact] = False
+    context.traps[Underflow] = True
     return context
+
+
+def _exact_sum(values: Iterable[Decimal]) -> Decimal:
+    values = [value for value in values if value != ZERO]
+    if not values:
+        return ZERO
+    # Keep small amounts when adding values of different sizes.
+    with localcontext(_money_context()) as context:
+        context.prec = max(
+            CALCULATION_PRECISION,
+            max(value.adjusted() for value in values)
+            - min(value.as_tuple().exponent for value in values)
+            + len(str(len(values))) + 1,
+        )
+        context.traps[Inexact] = True
+        return sum(values, ZERO)
+
+
+def _exact_product(left: Decimal, right: Decimal) -> Decimal:
+    with localcontext(_money_context()) as context:
+        context.prec = max(
+            CALCULATION_PRECISION,
+            len(left.as_tuple().digits) + len(right.as_tuple().digits),
+        )
+        context.traps[Inexact] = True
+        return left * right
 
 
 def _validate_symbol(symbol: str) -> None:
@@ -65,10 +95,7 @@ class Trade:
 
     @property
     def estimated_quantity(self) -> Decimal:
-        with localcontext(
-            Context(prec=CALCULATION_PRECISION, rounding=ROUND_HALF_EVEN)
-        ) as context:
-            context.traps[Underflow] = True
+        with localcontext(_money_context()):
             return self.value / self.reference_price
 
 
@@ -109,41 +136,72 @@ class Portfolio:
             if not ZERO <= weight <= ONE:
                 raise ValueError("Allocation weights must be between 0 and 1")
 
-        with localcontext(_money_context()):
-            if sum((weights[symbol] for symbol in sorted(weights)), ZERO) != ONE:
-                raise ValueError("Allocation weights must sum exactly to 1")
+        weight_total = _exact_sum(weights.values())
+        weight_error = _exact_sum((weight_total, ONE.copy_negate())).copy_abs()
+        if weight_error > ALLOCATION_TOLERANCE:
+            raise ValueError(
+                f"Allocation weights must sum to 1 within {ALLOCATION_TOLERANCE}"
+            )
+        if weight_total != ONE:
+            with localcontext(_money_context()):
+                weights = {
+                    symbol: weights[symbol] / weight_total for symbol in sorted(weights)
+                }
+            # Give the small remainder to the largest weight; ties use the symbol.
+            residual_symbol = max(sorted(weights), key=weights.__getitem__)
+            weights[residual_symbol] = _exact_sum(
+                [ONE]
+                + [weight.copy_negate() for symbol, weight in weights.items()
+                   if symbol != residual_symbol]
+            )
 
         object.__setattr__(self, "stocks", MappingProxyType(stock_by_symbol))
         object.__setattr__(self, "holdings", MappingProxyType(quantities))
         object.__setattr__(self, "allocation", MappingProxyType(weights))
 
     def rebalance(self) -> tuple[Trade, ...]:
+        # Return a plan so trades can be reviewed first.
         with localcontext(_money_context()):
             symbols = sorted(self.holdings.keys() | self.allocation.keys())
             prices = {
                 symbol: self.stocks[symbol].current_price() for symbol in symbols
             }
             current_values = {
-                symbol: self.holdings.get(symbol, ZERO) * prices[symbol]
+                symbol: _exact_product(self.holdings.get(symbol, ZERO), prices[symbol])
                 for symbol in symbols
             }
-            total_value = sum(current_values.values(), ZERO)
+            total_value = _exact_sum(current_values.values())
+            target_values = {
+                symbol: total_value * self.allocation.get(symbol, ZERO)
+                for symbol in symbols
+            }
+            # Keep the full portfolio value after rounding the targets.
+            residual_symbol = max(
+                sorted(self.allocation), key=self.allocation.__getitem__
+            )
+            target_values[residual_symbol] = _exact_sum(
+                [total_value]
+                + [value.copy_negate() for symbol, value in target_values.items()
+                   if symbol != residual_symbol]
+            )
             trades = []
 
             for symbol in symbols:
-                target_value = total_value * self.allocation.get(symbol, ZERO)
-                difference = target_value - current_values[symbol]
+                difference = _exact_sum(
+                    (target_values[symbol], current_values[symbol].copy_negate())
+                )
                 if difference == ZERO:
                     continue
                 trades.append(
                     Trade(
                         symbol=symbol,
                         action="BUY" if difference > ZERO else "SELL",
-                        value=abs(difference),
+                        value=difference.copy_abs(),
                         reference_price=prices[symbol],
                     )
                 )
 
+        # List sells first to help fund buys.
         return tuple(
             sorted(trades, key=lambda trade: (trade.action == "BUY", trade.symbol))
         )

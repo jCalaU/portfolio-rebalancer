@@ -2,6 +2,7 @@ import random
 import unittest
 from dataclasses import FrozenInstanceError
 from decimal import Decimal, Inexact, ROUND_UP, Underflow, localcontext
+from fractions import Fraction
 
 from portfolio import Portfolio, Stock
 
@@ -27,6 +28,34 @@ class PortfolioTests(unittest.TestCase):
         }
         inputs.update(overrides)
         return Portfolio(**inputs)
+
+    def resulting_values(self, portfolio):
+        values = {
+            symbol: Fraction(portfolio.holdings.get(symbol, D("0")))
+            * Fraction(stock.current_price())
+            for symbol, stock in portfolio.stocks.items()
+        }
+        initial_total = sum(values.values(), Fraction(0))
+        trades = portfolio.rebalance()
+        sales = purchases = Fraction(0)
+        for trade in trades:
+            value = Fraction(trade.value)
+            self.assertGreater(value, 0)
+            if trade.action == "SELL":
+                self.assertLessEqual(value, values[trade.symbol])
+                values[trade.symbol] -= value
+                sales += value
+            else:
+                self.assertEqual(trade.action, "BUY")
+                values[trade.symbol] += value
+                purchases += value
+        self.assertEqual(sum(values.values(), Fraction(0)), initial_total)
+        self.assertEqual(sales, purchases)
+        self.assertEqual(
+            [trade.action for trade in trades],
+            sorted((trade.action for trade in trades), reverse=True),
+        )
+        return values
 
     def test_current_price_returns_supplied_snapshot(self):
         self.assertEqual(Stock("MELI", D("250.01")).current_price(), D("250.01"))
@@ -140,18 +169,159 @@ class PortfolioTests(unittest.TestCase):
             self.assertEqual(repeating.estimated_quantity, D("0." + "6" * 49 + "7"))
             self.assertEqual(dict(context.flags), before_flags)
 
-    def test_arithmetic_beyond_supported_precision_raises_inexact(self):
+    def test_totals_beyond_fifty_digits_keep_exact_value_after_target_rounding(self):
         portfolio = Portfolio(
             [Stock("FTUL", D("1")), Stock("MELI", D("1"))],
             {"FTUL": D("1e50"), "MELI": D("1")},
             {"FTUL": D("0.5"), "MELI": D("0.5")},
         )
-        with self.assertRaises(Inexact):
-            portfolio.rebalance()
+        values = self.resulting_values(portfolio)
+        self.assertEqual(values["FTUL"], Fraction(10 ** 50, 2) + 1)
+        self.assertEqual(values["MELI"], Fraction(10 ** 50, 2))
 
-    def test_tiny_allocation_excess_is_not_silently_rounded_to_one(self):
-        with self.assertRaises(Inexact):
-            self.portfolio(allocation={"FTUL": D("1"), "MELI": D("1e-60"), "NU": D("0")})
+    def test_position_values_beyond_fifty_digits_are_preserved_exactly(self):
+        portfolio = Portfolio(
+            [Stock("FTUL", D("123456789012345678901234567890123456789012345678901234567890.123")),
+             Stock("MELI", D("0.0001"))],
+            {"FTUL": D("2.01"), "MELI": D("1")},
+            {"FTUL": D("0.6"), "MELI": D("0.4")},
+        )
+        self.resulting_values(portfolio)
+
+    def test_trade_differences_keep_residuals_beyond_fifty_digits(self):
+        tiny = D("1e-60")
+        portfolio = Portfolio(
+            [Stock("FTUL", D("1")), Stock("MELI", D("1"))],
+            {"FTUL": D("1"), "MELI": tiny},
+            {"FTUL": D("0.5"), "MELI": D("0.5")},
+        )
+        values = self.resulting_values(portfolio)
+        self.assertEqual(values["FTUL"], Fraction(1, 2) + Fraction(tiny))
+        self.assertEqual(values["MELI"], Fraction(1, 2))
+        self.assertEqual(
+            [(trade.action, Fraction(trade.value)) for trade in portfolio.rebalance()],
+            [("SELL", Fraction(1, 2) - Fraction(tiny)),
+             ("BUY", Fraction(1, 2) - Fraction(tiny))],
+        )
+
+    def test_tiny_allocation_excess_is_accepted_and_normalized(self):
+        portfolio = self.portfolio(
+            allocation={"FTUL": D("1"), "MELI": D("1e-60"), "NU": D("0")},
+        )
+        self.assertEqual(sum(map(Fraction, portfolio.allocation.values())), 1)
+        self.assertGreater(portfolio.allocation["MELI"], D("0"))
+        self.assertEqual(portfolio.allocation["NU"], D("0"))
+        self.resulting_values(portfolio)
+
+    def test_allocation_tolerance_includes_both_boundaries(self):
+        with localcontext() as context:
+            context.prec = 200
+            tolerance = D("0.000001")
+            tiny = D("1e-60")
+            for sign in (-1, 1):
+                for distance in (tolerance - tiny, tolerance):
+                    allocation = {"FTUL": D("0.5"),
+                                  "MELI": D("0.5") + sign * distance}
+                    with self.subTest(sign=sign, distance=distance):
+                        portfolio = self.portfolio(allocation=allocation)
+                        self.assertEqual(
+                            sum(map(Fraction, portfolio.allocation.values())), 1,
+                        )
+                        self.resulting_values(portfolio)
+
+    def test_allocation_tolerance_rejects_values_just_outside_both_boundaries(self):
+        with localcontext() as context:
+            context.prec = 200
+            distance = D("0.000001") + D("1e-60")
+            for sign in (-1, 1):
+                allocation = {"FTUL": D("0.5"),
+                              "MELI": D("0.5") + sign * distance}
+                with self.subTest(sign=sign), self.assertRaises(ValueError):
+                    self.portfolio(allocation=allocation)
+
+    def test_approximate_thirds_are_normalized_with_a_deterministic_residual(self):
+        allocation = dict.fromkeys(("NU", "MELI", "FTUL"), D("0.333333"))
+        portfolio = self.portfolio(allocation=allocation)
+        third = D("0." + "3" * 50)
+        self.assertEqual(dict(portfolio.allocation), {
+            "FTUL": D("0." + "3" * 49 + "4"),
+            "MELI": third,
+            "NU": third,
+        })
+        self.assertEqual(allocation, dict.fromkeys(allocation, D("0.333333")))
+        self.resulting_values(portfolio)
+
+    def test_normalization_assigns_its_residual_to_the_largest_weight(self):
+        portfolio = self.portfolio(
+            allocation={"FTUL": D("0.1666665"), "MELI": D("0.666666"),
+                        "NU": D("0.1666665")},
+        )
+        sixth = D("0.1" + "6" * 48 + "7")
+        self.assertEqual(dict(portfolio.allocation), {
+            "FTUL": sixth, "MELI": D("0." + "6" * 50), "NU": sixth,
+        })
+        self.resulting_values(portfolio)
+
+    def test_target_rounding_residual_goes_to_the_largest_weight(self):
+        with localcontext() as context:
+            context.prec = 200
+            third = D("0." + "3" * 60)
+            largest = D("1") - third * 2
+        portfolio = self.portfolio(
+            stocks=[Stock(symbol, D("1")) for symbol in ("FTUL", "MELI", "NU")],
+            holdings={"FTUL": D("1")},
+            allocation={"FTUL": third, "MELI": third, "NU": largest},
+        )
+        self.assertEqual(portfolio.allocation["NU"], largest)
+        values = self.resulting_values(portfolio)
+        self.assertEqual(values["FTUL"], Fraction(D("0." + "3" * 50)))
+        self.assertEqual(values["MELI"], Fraction(D("0." + "3" * 50)))
+        self.assertEqual(values["NU"], Fraction(D("0." + "3" * 49 + "4")))
+
+    def test_normalization_preserves_zero_targets(self):
+        portfolio = self.portfolio(
+            allocation={"FTUL": D("0"), "MELI": D("0.999999"), "NU": D("0")},
+        )
+        self.assertEqual(dict(portfolio.allocation), {
+            "FTUL": D("0"), "MELI": D("1"), "NU": D("0"),
+        })
+        values = self.resulting_values(portfolio)
+        self.assertEqual(values["FTUL"], 0)
+        self.assertEqual(values["NU"], 0)
+
+    def test_normalization_and_rounded_targets_ignore_callers_decimal_context(self):
+        allocation = dict.fromkeys(self.allocation, D("0.333333"))
+        expected = self.portfolio(allocation=allocation)
+        with localcontext() as context:
+            context.prec = 3
+            context.rounding = ROUND_UP
+            context.traps[Inexact] = True
+            before = (context.prec, context.rounding, dict(context.traps),
+                      dict(context.flags))
+            actual = self.portfolio(allocation=allocation)
+            self.assertEqual(actual.allocation, expected.allocation)
+            self.assertEqual(actual.rebalance(), expected.rebalance())
+            self.assertEqual((context.prec, context.rounding, dict(context.traps),
+                              dict(context.flags)), before)
+
+    def test_normalized_plans_are_deterministic_and_do_not_mutate_inputs(self):
+        allocation = dict.fromkeys(self.allocation, D("0.333333"))
+        original = dict(allocation)
+        portfolio = self.portfolio(allocation=allocation)
+        before = (dict(portfolio.stocks), dict(portfolio.holdings),
+                  dict(portfolio.allocation))
+        trades = portfolio.rebalance()
+        reordered = self.portfolio(
+            stocks=reversed(self.stocks),
+            holdings=dict(reversed(list(self.holdings.items()))),
+            allocation=dict(reversed(list(allocation.items()))),
+        )
+        self.assertEqual(portfolio.rebalance(), trades)
+        self.assertEqual(reordered.rebalance(), trades)
+        self.assertEqual((dict(portfolio.stocks), dict(portfolio.holdings),
+                          dict(portfolio.allocation)), before)
+        self.assertEqual(allocation, original)
+        self.assertEqual(self.holdings, {"FTUL": D("8"), "MELI": D("16"), "NU": D("20")})
 
     def test_input_collection_order_does_not_change_the_plan(self):
         expected = self.portfolio().rebalance()
